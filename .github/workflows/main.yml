@@ -1,0 +1,412 @@
+name: RDP + Roblox
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+
+      # =========================================================
+      # 1. CONFIGURAR RDP
+      # =========================================================
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          Write-Host "Configurando Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" `
+            -Value 0 `
+            -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          Set-Service -Name TermService -StartupType Automatic
+
+          Restart-Service -Name TermService -Force
+
+          Write-Host "RDP configurado."
+
+      # =========================================================
+      # 2. CRIAR USUARIO RDP
+      # =========================================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          Write-Host "Criando usuário RDP..."
+
+          $username = "RDP"
+
+          $upper = [char[]](65..90)
+          $lower = [char[]](97..122)
+          $numbers = [char[]](48..57)
+          $special = [char[]](33..47)
+
+          $passwordChars = @()
+
+          $passwordChars += $upper | Get-Random -Count 4
+          $passwordChars += $lower | Get-Random -Count 4
+          $passwordChars += $numbers | Get-Random -Count 4
+          $passwordChars += $special | Get-Random -Count 4
+
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+              Write-Host "Usuário RDP já existe."
+              Set-LocalUser `
+                -Name $username `
+                -Password $securePassword
+          }
+          else {
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -AccountNeverExpires `
+                -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "RDP USUARIO: $username"
+          Write-Host "RDP SENHA: $password"
+          Write-Host "================================="
+
+      # =========================================================
+      # 3. INSTALAR TAILSCALE
+      # =========================================================
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Instalando Tailscale..."
+
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installer
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item $installer -Force
+
+          Write-Host "Tailscale instalado."
+
+      # =========================================================
+      # 4. CONECTAR TAILSCALE
+      # =========================================================
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          Write-Host "Conectando ao Tailscale..."
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          Start-Sleep -Seconds 10
+
+          $tsIP = $null
+
+          for ($i = 1; $i -le 20; $i++) {
+
+              $tsIP = (& $tailscale ip -4 2>$null | Select-Object -First 1).Trim()
+
+              if ($tsIP) {
+                  break
+              }
+
+              Write-Host "Aguardando IP do Tailscale..."
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Não foi possível obter o IP do Tailscale."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "TAILSCALE IP: $tsIP"
+          Write-Host "================================="
+
+      # =========================================================
+      # 5. VERIFICAR RDP
+      # =========================================================
+      - name: Verify RDP
+        shell: powershell
+        run: |
+          Write-Host "Testando porta RDP..."
+
+          Start-Sleep -Seconds 5
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
+
+          if ($result.TcpTestSucceeded) {
+              Write-Host "RDP funcionando."
+          }
+          else {
+              Write-Warning "A porta RDP ainda não respondeu."
+          }
+
+      # =========================================================
+      # 6. BAIXAR ROBLOX
+      # =========================================================
+      - name: Install Roblox
+        shell: powershell
+        run: |
+          Write-Host "Baixando Roblox..."
+
+          $robloxInstaller = "$env:TEMP\RobloxPlayerLauncher.exe"
+
+          $robloxUrl = "https://setup.rbxcdn.com/RobloxPlayerLauncher.exe"
+
+          try {
+
+              Invoke-WebRequest `
+                -Uri $robloxUrl `
+                -OutFile $robloxInstaller `
+                -UseBasicParsing
+
+          }
+          catch {
+
+              Write-Warning "Não foi possível baixar o Roblox."
+              Write-Warning $_
+              exit 0
+          }
+
+          if (Test-Path $robloxInstaller) {
+
+              Write-Host "Instalador encontrado."
+
+              Start-Process `
+                -FilePath $robloxInstaller `
+                -ArgumentList "-install" `
+                -Wait
+
+              Write-Host "Instalação do Roblox concluída."
+
+          }
+          else {
+
+              Write-Warning "Instalador do Roblox não encontrado."
+          }
+
+      # =========================================================
+      # 7. LOCALIZAR ROBLOX
+      # =========================================================
+      - name: Find Roblox
+        shell: powershell
+        run: |
+          Write-Host "Procurando Roblox instalado..."
+
+          $possiblePaths = @(
+              "$env:LOCALAPPDATA\Roblox\Versions",
+              "$env:ProgramFiles\Roblox",
+              "${env:ProgramFiles(x86)}\Roblox"
+          )
+
+          $found = $false
+
+          foreach ($path in $possiblePaths) {
+
+              if (Test-Path $path) {
+
+                  Write-Host "Encontrado: $path"
+
+                  $files = Get-ChildItem `
+                    -Path $path `
+                    -Recurse `
+                    -Filter "RobloxPlayerBeta.exe" `
+                    -ErrorAction SilentlyContinue
+
+                  foreach ($file in $files) {
+
+                      Write-Host "Roblox encontrado em:"
+                      Write-Host $file.FullName
+
+                      "ROBLOX_EXE=$($file.FullName)" >> $env:GITHUB_ENV
+
+                      $found = $true
+                  }
+              }
+          }
+
+          if (-not $found) {
+              Write-Warning "RobloxPlayerBeta.exe não foi encontrado."
+          }
+
+      # =========================================================
+      # 8. CRIAR TAREFA PARA INICIAR ROBLOX AO ENTRAR NO RDP
+      # =========================================================
+      - name: Configure Roblox Auto Start
+        shell: powershell
+        run: |
+          if (-not $env:ROBLOX_EXE) {
+              Write-Warning "Executável do Roblox não encontrado."
+              exit 0
+          }
+
+          Write-Host "Configurando inicialização automática do Roblox..."
+
+          $action = New-ScheduledTaskAction `
+            -Execute $env:ROBLOX_EXE
+
+          $trigger = New-ScheduledTaskTrigger `
+            -AtLogOn `
+            -User "RDP"
+
+          $principal = New-ScheduledTaskPrincipal `
+            -UserId "RDP" `
+            -LogonType Interactive `
+            -RunLevel Highest
+
+          $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable
+
+          Register-ScheduledTask `
+            -TaskName "Start Roblox" `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Force
+
+          Write-Host "Roblox será iniciado quando o usuário RDP entrar."
+
+      # =========================================================
+      # 9. TENTAR INICIAR ROBLOX
+      # =========================================================
+      - name: Try Start Roblox
+        shell: powershell
+        run: |
+          if ($env:ROBLOX_EXE) {
+
+              Write-Host "Tentando iniciar Roblox..."
+
+              try {
+
+                  Start-Process `
+                    -FilePath $env:ROBLOX_EXE `
+                    -ErrorAction Stop
+
+                  Write-Host "Roblox iniciado."
+
+              }
+              catch {
+
+                  Write-Warning "Não foi possível iniciar o Roblox diretamente."
+                  Write-Warning $_
+              }
+
+          }
+          else {
+
+              Write-Warning "Executável do Roblox não encontrado."
+          }
+
+      # =========================================================
+      # 10. MOSTRAR DADOS DO RDP
+      # =========================================================
+      - name: RDP Information
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "              RDP DISPONÍVEL"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Endereço:"
+          Write-Host "$env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "Usuário:"
+          Write-Host "$env:RDP_USERNAME"
+          Write-Host ""
+          Write-Host "Senha:"
+          Write-Host "$env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "Porta:"
+          Write-Host "3389"
+          Write-Host ""
+          Write-Host "Use o Windows App para conectar."
+          Write-Host ""
+          Write-Host "=============================================="
+
+      # =========================================================
+      # 11. MANTER O PC LIGADO
+      # =========================================================
+      - name: Keep RDP Alive
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "RDP ativo."
+          Write-Host "Não encerre este workflow enquanto estiver usando o PC."
+          Write-Host ""
+
+          while ($true) {
+
+              Write-Host "[$(Get-Date)] RDP + Tailscale ativos..."
+
+              Start-Sleep -Seconds 300
+          }
